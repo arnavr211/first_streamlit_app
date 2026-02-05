@@ -10,10 +10,10 @@ streamlit run streamlit_app.py
 
 ## Dependencies
 
-Python packages (no requirements.txt yet — install manually):
-- `streamlit`
-- `nfl_data_py` (Python interface to nflfastR/nflverse data)
-- `pandas`
+Python packages (no requirements.txt yet):
+```bash
+pip install streamlit nfl_data_py pandas
+```
 
 ## Architecture
 
@@ -24,3 +24,12 @@ Key details:
 - Interactive filters: team on offense, play type, and week
 - Displays a subset of columns (game_id, week, teams, play_type, desc, yards_gained, epa, down, ydstogo, player names)
 - The nfl_data_py package pulls parquet files from the nflverse-data GitHub releases
+
+## nflverse Data Notes
+
+The play-by-play dataset has 372 columns. Key column groups for analysis:
+- **Game context**: `game_id`, `week`, `posteam`, `defteam`, `qtr`, `quarter_seconds_remaining`, `score_differential`
+- **Play info**: `play_type`, `down`, `ydstogo`, `yards_gained`, `desc`
+- **Advanced metrics**: `epa`, `wpa`, `air_yards`, `yards_after_catch`, `cpoe`
+- **Player names**: `passer_player_name`, `rusher_player_name`, `receiver_player_name`
+- Play types: `pass`, `run`, `kickoff`, `punt`, `field_goal`, `extra_point`, `no_play`, `qb_kneel`, `qb_spike`
