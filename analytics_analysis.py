@@ -85,9 +85,65 @@ def dashmart_vs_grocery(df):
         print(f"  Item missing rate: {subset['missing_count'].sum()/subset['total_items'].sum()*100:.1f}%")
         print(f"  Complaint rate: {subset['missing_report'].mean()*100:.1f}%")
 
+def lateness_analysis(df):
+    """Lateness analysis with timestamps converted from UTC to Eastern Time (Cincinnati)."""
+    deliv = df.groupby('DELIVERY_UUID').first()
+    deliv['created_local'] = deliv['DELIV_CREATED_AT'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
+    deliv['hour_local'] = deliv['created_local'].dt.hour
+    deliv['dow_local'] = deliv['created_local'].dt.day_name()
+
+    print("\n" + "=" * 60)
+    print("HOUR-OF-DAY DELIVERY PATTERNS (Eastern Time / Local)")
+    print("=" * 60)
+    hour = deliv.groupby('hour_local').agg(
+        deliveries=('DELIV_CREATED_AT', 'count'),
+        pct_late=('DELIV_IS_20_MIN_LATE', 'mean'),
+        avg_clat=('DELIV_CLAT', 'mean')
+    ).sort_index()
+    hour['pct_late'] = (hour['pct_late'] * 100).round(1)
+    hour['avg_clat'] = hour['avg_clat'].round(2)
+    print(hour.to_string())
+
+    print("\n" + "=" * 60)
+    print("DAYPART ANALYSIS (Eastern Time / Local)")
+    print("=" * 60)
+    def daypart(h):
+        if 6 <= h < 11: return '1-Morning (6am-11am)'
+        elif 11 <= h < 14: return '2-Lunch (11am-2pm)'
+        elif 14 <= h < 17: return '3-Afternoon (2pm-5pm)'
+        elif 17 <= h < 21: return '4-Dinner (5pm-9pm)'
+        elif 21 <= h <= 23: return '5-Late Night (9pm-12am)'
+        else: return '6-Overnight (12am-6am)'
+
+    deliv['daypart'] = deliv['hour_local'].apply(daypart)
+    dp = deliv.groupby('daypart').agg(
+        deliveries=('DELIV_CREATED_AT', 'count'),
+        pct_late=('DELIV_IS_20_MIN_LATE', 'mean'),
+        avg_clat=('DELIV_CLAT', 'mean'),
+        pct_cancelled=('DELIV_CANCELLED_AT', lambda x: x.notna().mean()),
+        pct_complaint=('DELIV_MISSING_INCORRECT_REPORT', 'mean')
+    ).sort_index()
+    dp['pct_late'] = (dp['pct_late'] * 100).round(1)
+    dp['avg_clat'] = dp['avg_clat'].round(2)
+    dp['pct_cancelled'] = (dp['pct_cancelled'] * 100).round(1)
+    dp['pct_complaint'] = (dp['pct_complaint'] * 100).round(1)
+    print(dp.to_string())
+
+    print("\n" + "=" * 60)
+    print("LATE RATE BY STORE x DAYPART (Eastern Time)")
+    print("=" * 60)
+    sp = deliv.groupby(['DELIV_STORE_NAME', 'daypart']).agg(
+        deliveries=('DELIV_CREATED_AT', 'count'),
+        pct_late=('DELIV_IS_20_MIN_LATE', 'mean')
+    )
+    sp['pct_late'] = (sp['pct_late'] * 100).round(1)
+    print(sp.to_string())
+
+
 if __name__ == '__main__':
     df = load_data()
     deliv = delivery_level_summary(df)
     store_breakdown(deliv)
     item_analysis(df)
     dashmart_vs_grocery(df)
+    lateness_analysis(df)
