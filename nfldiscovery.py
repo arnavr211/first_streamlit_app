@@ -42,15 +42,7 @@ MIN_DIM_POP     = 0.20
 MIN_CORR_GAMES  = 8
 MIN_LEAGUE_ABS_R = 0.10
 
-# ── Load data ──────────────────────────────────────────────────────────────────
-
-print("Loading 2025 nflfastR play-by-play data...")
-pbp = nfl.import_pbp_data([2025])
-plays = pbp[pbp["play_type"].isin(["pass", "run"]) & pbp["epa"].notna()].copy()
-print(f"  {len(plays):,} pass/run plays  |  {plays['game_id'].nunique()} games  |  "
-      f"{plays['posteam'].nunique()} teams\n")
-
-# ── Derived columns ────────────────────────────────────────────────────────────
+# ── Helper functions ────────────────────────────────────────────────────────────
 
 def _score_bucket(diff):
     if pd.isna(diff): return None
@@ -77,22 +69,30 @@ def notna(x):
     except (TypeError, ValueError):
         return True
 
-plays["score_bucket"]     = plays["score_differential"].apply(_score_bucket)
-plays["personnel_group"]  = plays["offense_personnel"].apply(_personnel_group)
-plays["down_str"]         = plays["down"].apply(lambda d: f"Down {int(d)}" if notna(d) else None)
-plays["qtr_str"]          = plays["qtr"].apply(lambda q: f"Q{int(q)}" if q <= 4 else "OT")
-plays["defenders_in_box"] = plays["defenders_in_box"].apply(
-    lambda x: f"{int(x)} in box" if notna(x) else None)
-plays["pass_rushers"]     = plays["number_of_pass_rushers"].apply(
-    lambda x: f"{int(x)} rushers" if notna(x) else None)
-plays["shotgun_label"]    = plays["shotgun"].apply(
-    lambda x: "Shotgun" if x == 1 else "Under Center" if x == 0 else None)
-plays["no_huddle_label"]  = plays["no_huddle"].apply(
-    lambda x: "No Huddle" if x == 1 else "Huddle" if x == 0 else None)
-plays["qb_scramble_label"]= plays["qb_scramble"].apply(
-    lambda x: "Scramble" if x == 1 else "Designed" if x == 0 else None)
-plays["pressure_label"]   = plays["was_pressure"].apply(
-    lambda x: "Pressure" if str(x) == "True" else "Clean" if str(x) == "False" else None)
+def add_derived_columns(plays):
+    """
+    Add derived categorical columns to a plays DataFrame in-place.
+    Safe to call on any pass/run subset of the nflverse play-by-play data.
+    Returns the DataFrame (also mutated in-place).
+    """
+    plays["score_bucket"]     = plays["score_differential"].apply(_score_bucket)
+    plays["personnel_group"]  = plays["offense_personnel"].apply(_personnel_group)
+    plays["down_str"]         = plays["down"].apply(lambda d: f"Down {int(d)}" if notna(d) else None)
+    plays["qtr_str"]          = plays["qtr"].apply(lambda q: f"Q{int(q)}" if q <= 4 else "OT")
+    plays["defenders_in_box"] = plays["defenders_in_box"].apply(
+        lambda x: f"{int(x)} in box" if notna(x) else None)
+    plays["pass_rushers"]     = plays["number_of_pass_rushers"].apply(
+        lambda x: f"{int(x)} rushers" if notna(x) else None)
+    plays["shotgun_label"]    = plays["shotgun"].apply(
+        lambda x: "Shotgun" if x == 1 else "Under Center" if x == 0 else None)
+    plays["no_huddle_label"]  = plays["no_huddle"].apply(
+        lambda x: "No Huddle" if x == 1 else "Huddle" if x == 0 else None)
+    plays["qb_scramble_label"]= plays["qb_scramble"].apply(
+        lambda x: "Scramble" if x == 1 else "Designed" if x == 0 else None)
+    plays["pressure_label"]   = plays["was_pressure"].apply(
+        lambda x: "Pressure" if str(x) == "True" else "Clean" if str(x) == "False" else None)
+    return plays
+
 
 # ── Auto-detect METRICS ────────────────────────────────────────────────────────
 # Numeric columns that represent per-play outcomes or QB quality signals.
@@ -192,11 +192,6 @@ def _auto_detect_metrics(df, blacklist, min_pop=MIN_METRIC_POP):
         metrics.append(col)
     return sorted(metrics)
 
-METRICS = _auto_detect_metrics(plays, _METRIC_BLACKLIST)
-print(f"Auto-detected {len(METRICS)} metrics:")
-print("  " + ", ".join(METRICS) + "\n")
-
-
 # ── Auto-detect DIMENSIONS ─────────────────────────────────────────────────────
 # Object columns with 2–20 unique values, plus derived categorical columns,
 # plus select low-cardinality numeric columns treated as categories.
@@ -270,12 +265,6 @@ def _auto_detect_dims(df, blacklist, min_pop=MIN_DIM_POP, max_unique=20):
             continue
         dims.append(col)
     return sorted(dims)
-
-DIMS_AUTO = _auto_detect_dims(plays, _DIM_BLACKLIST)
-DIMS = sorted(set(DIMS_AUTO + DIMS_DERIVED))
-print(f"Auto-detected {len(DIMS)} dimensions:")
-print("  " + ", ".join(DIMS) + "\n")
-
 
 # ── Split analysis ─────────────────────────────────────────────────────────────
 
@@ -430,24 +419,6 @@ def composite_score(row):
     return abs(row["effect_size"]) * np.log1p(row["sample_size"] / MIN_PLAYS)
 
 
-# ── Run everything ─────────────────────────────────────────────────────────────
-
-print("Running split analysis...")
-split_findings = run_split_analysis(plays, METRICS, DIMS)
-print(f"  → {len(split_findings)} flagged split findings\n")
-
-print("Running correlation analysis...")
-corr_findings = run_correlation_analysis(plays, METRICS)
-print(f"  → {len(corr_findings)} flagged correlation findings\n")
-
-all_findings = split_findings + corr_findings
-df_all = pd.DataFrame(all_findings)
-df_all["composite_score"] = df_all.apply(composite_score, axis=1)
-df_all = df_all.sort_values("composite_score", ascending=False).reset_index(drop=True)
-df_all.index += 1
-df_all.index.name = "rank"
-
-
 # ── Interpretation strings ─────────────────────────────────────────────────────
 
 def make_interpretation(row):
@@ -469,73 +440,125 @@ def make_interpretation(row):
             f"relationship is {row['direction']} than league norm"
         )
 
-df_all["interpretation"] = df_all.apply(make_interpretation, axis=1)
+def _rank_and_interpret(all_findings):
+    """Convert a list of finding dicts into a ranked DataFrame with interpretations."""
+    df_all = pd.DataFrame(all_findings)
+    df_all["composite_score"] = df_all.apply(composite_score, axis=1)
+    df_all = df_all.sort_values("composite_score", ascending=False).reset_index(drop=True)
+    df_all.index += 1
+    df_all.index.name = "rank"
+    df_all["interpretation"] = df_all.apply(make_interpretation, axis=1)
+    return df_all
 
 
-# ── Console output ─────────────────────────────────────────────────────────────
+def _print_findings(df_all):
+    """Pretty-print findings summary to stdout."""
+    type_counts = df_all["finding_type"].value_counts()
+    print(f"{'='*90}")
+    print(f"TOTAL FINDINGS: {len(df_all)}  "
+          f"(split: {type_counts.get('split',0)}, "
+          f"correlation: {type_counts.get('correlation',0)})")
+    print(f"{'='*90}\n")
 
-type_counts = df_all["finding_type"].value_counts()
-print(f"{'='*90}")
-print(f"TOTAL FINDINGS: {len(df_all)}  "
-      f"(split: {type_counts.get('split',0)}, "
-      f"correlation: {type_counts.get('correlation',0)})")
-print(f"{'='*90}\n")
+    print(f"TOP {min(30, len(df_all))} FINDINGS (ranked by effect size × sample weight)\n")
 
-print(f"TOP {min(30, len(df_all))} FINDINGS (ranked by effect size × sample weight)\n")
+    hdr = f"{'#':>4}  {'Team':<5}  {'Type':<6}  {'Metric':<28}  {'Dim':<20}  "
+    hdr += f"{'Split Value':<26}  {'n':>5}  {'Team':>7}  {'Lg Avg':>7}  {'Δ':>7}  {'z':>6}"
+    print(hdr)
+    print("-" * len(hdr))
 
-hdr = f"{'#':>4}  {'Team':<5}  {'Type':<6}  {'Metric':<28}  {'Dim':<20}  "
-hdr += f"{'Split Value':<26}  {'n':>5}  {'Team':>7}  {'Lg Avg':>7}  {'Δ':>7}  {'z':>6}"
-print(hdr)
-print("-" * len(hdr))
+    for rank, row in df_all.head(30).iterrows():
+        dim_short    = row["dimension"][:20]
+        val_short    = str(row["dimension_value"])[:26]
+        metric_short = row["metric"][:28]
+        delta_str    = f"{'+' if row['delta'] > 0 else ''}{row['delta']:.3f}"
+        print(
+            f"{rank:>4}  {row['team']:<5}  {row['finding_type'][:6]:<6}  {metric_short:<28}  "
+            f"{dim_short:<20}  {val_short:<26}  {row['sample_size']:>5}  "
+            f"{row['team_value']:>7.3f}  {row['league_avg']:>7.3f}  {delta_str:>7}  "
+            f"{row['std_devs_away']:>6.2f}"
+        )
 
-for rank, row in df_all.head(30).iterrows():
-    dim_short = row["dimension"][:20]
-    val_short = str(row["dimension_value"])[:26]
-    metric_short = row["metric"][:28]
-    delta_str = f"{'+' if row['delta'] > 0 else ''}{row['delta']:.3f}"
-    print(
-        f"{rank:>4}  {row['team']:<5}  {row['finding_type'][:6]:<6}  {metric_short:<28}  "
-        f"{dim_short:<20}  {val_short:<26}  {row['sample_size']:>5}  "
-        f"{row['team_value']:>7.3f}  {row['league_avg']:>7.3f}  {delta_str:>7}  "
-        f"{row['std_devs_away']:>6.2f}"
+    # Per-dimension breakdown
+    print(f"\n{'='*60}")
+    print("FINDINGS COUNT BY DIMENSION")
+    print(f"{'='*60}")
+    dim_summary = (
+        df_all.reset_index()
+              .groupby("dimension")
+              .agg(
+                  findings=("rank", "count"),
+                  avg_effect=("effect_size", lambda x: x.abs().mean()),
+                  max_effect=("effect_size", lambda x: x.abs().max()),
+                  above=("direction", lambda x: (x.isin(["above", "stronger"])).sum()),
+                  below=("direction", lambda x: (x.isin(["below", "weaker"])).sum()),
+              )
+              .sort_values("findings", ascending=False)
     )
+    print(dim_summary.to_string())
 
-# Per-dimension breakdown
-print(f"\n{'='*60}")
-print("FINDINGS COUNT BY DIMENSION")
-print(f"{'='*60}")
-dim_summary = (
-    df_all.reset_index()
-          .groupby("dimension")
-          .agg(
-              findings=("rank", "count"),
-              avg_effect=("effect_size", lambda x: x.abs().mean()),
-              max_effect=("effect_size", lambda x: x.abs().max()),
-              above=("direction", lambda x: (x.isin(["above","stronger"])).sum()),
-              below=("direction", lambda x: (x.isin(["below","weaker"])).sum()),
-          )
-          .sort_values("findings", ascending=False)
-)
-print(dim_summary.to_string())
+    # Top team summary
+    print(f"\n{'='*60}")
+    print("MOST FLAGGED TEAMS")
+    print(f"{'='*60}")
+    team_counts = df_all.reset_index().groupby("team")["rank"].count().sort_values(ascending=False)
+    print(team_counts.head(10).to_string())
 
-# Top team summary
-print(f"\n{'='*60}")
-print("MOST FLAGGED TEAMS")
-print(f"{'='*60}")
-team_counts = df_all.reset_index().groupby("team")["rank"].count().sort_values(ascending=False)
-print(team_counts.head(10).to_string())
+    return df_all["finding_type"].value_counts()
 
 
-# ── Save CSV ───────────────────────────────────────────────────────────────────
+def load_plays(seasons=None):
+    """
+    Load nflverse play-by-play data, filter to pass/run plays with valid EPA,
+    and add all derived columns. Returns the enriched DataFrame.
+    """
+    if seasons is None:
+        seasons = [2025]
+    print(f"Loading nflfastR play-by-play data (seasons={seasons})...")
+    pbp = nfl.import_pbp_data(seasons)
+    plays = pbp[pbp["play_type"].isin(["pass", "run"]) & pbp["epa"].notna()].copy()
+    print(f"  {len(plays):,} pass/run plays  |  {plays['game_id'].nunique()} games  |  "
+          f"{plays['posteam'].nunique()} teams\n")
+    add_derived_columns(plays)
+    return plays
 
-output_cols = [
-    "team", "metric", "dimension", "dimension_value",
-    "team_value", "league_avg", "std_devs_away",
-    "sample_size", "interpretation",
-]
 
-top_df = df_all.head(TOP_N).reset_index()[["rank"] + output_cols]
-top_df.to_csv(OUTPUT_CSV, index=False)
-print(f"\nTop {TOP_N} findings saved → {OUTPUT_CSV}")
-print(f"Total findings available: {len(df_all)} "
-      f"({type_counts.get('split',0)} splits + {type_counts.get('correlation',0)} correlations)")
+def main(output_csv=OUTPUT_CSV, top_n=TOP_N, seasons=None):
+    """Run the full discovery pipeline and write findings to CSV."""
+    plays = load_plays(seasons)
+
+    metrics = _auto_detect_metrics(plays, _METRIC_BLACKLIST)
+    print(f"Auto-detected {len(metrics)} metrics:")
+    print("  " + ", ".join(metrics) + "\n")
+
+    dims_auto = _auto_detect_dims(plays, _DIM_BLACKLIST)
+    dims = sorted(set(dims_auto + DIMS_DERIVED))
+    print(f"Auto-detected {len(dims)} dimensions:")
+    print("  " + ", ".join(dims) + "\n")
+
+    print("Running split analysis...")
+    split_findings = run_split_analysis(plays, metrics, dims)
+    print(f"  → {len(split_findings)} flagged split findings\n")
+
+    print("Running correlation analysis...")
+    corr_findings = run_correlation_analysis(plays, metrics)
+    print(f"  → {len(corr_findings)} flagged correlation findings\n")
+
+    df_all = _rank_and_interpret(split_findings + corr_findings)
+    type_counts = _print_findings(df_all)
+
+    output_cols = [
+        "team", "metric", "dimension", "dimension_value",
+        "team_value", "league_avg", "std_devs_away",
+        "sample_size", "interpretation",
+    ]
+    top_df = df_all.head(top_n).reset_index()[["rank"] + output_cols]
+    top_df.to_csv(output_csv, index=False)
+    print(f"\nTop {top_n} findings saved → {output_csv}")
+    print(f"Total findings available: {len(df_all)} "
+          f"({type_counts.get('split', 0)} splits + "
+          f"{type_counts.get('correlation', 0)} correlations)")
+
+
+if __name__ == "__main__":
+    main()
