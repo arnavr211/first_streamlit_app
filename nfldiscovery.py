@@ -431,6 +431,24 @@ def make_interpretation(row):
             f"z={row['std_devs_away']:.2f} — "
             f"{abs(row['std_devs_away']):.1f} std devs {row['direction']} average"
         )
+    elif row["finding_type"] == "trend":
+        sign = "+" if row["delta"] > 0 else ""
+        return (
+            f"{row['team']} weekly trend in {row['metric']}: "
+            f"slope={row['team_value']:.5f} vs league mean slope={row['league_avg']:.5f} "
+            f"({sign}{row['delta']:.5f}), weeks={row['sample_size']}, "
+            f"z={row['std_devs_away']:.2f} — "
+            f"metric is {row['direction']} over the season vs typical team trajectory"
+        )
+    elif row["finding_type"] == "efficiency_gap":
+        sign = "+" if row["delta"] > 0 else ""
+        return (
+            f"{row['team']} efficiency gap in {row['metric']}: "
+            f"team={row['team_value']:.3f} vs league={row['league_avg']:.3f} "
+            f"({sign}{row['delta']:.3f}), n={row['sample_size']}, "
+            f"z={row['std_devs_away']:.2f} — "
+            f"team is a {row['dimension_value']}"
+        )
     else:
         return (
             f"{row['team']} correlation {row['metric']}: "
