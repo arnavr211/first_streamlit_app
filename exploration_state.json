@@ -1,0 +1,14 @@
+{
+  "phase": "single",
+  "lens_history": {
+    "player-level": {
+      "use_count": 1,
+      "last_used": "2026-02-24",
+      "findings_files": [
+        "/home/user/first_streamlit_app/lens_findings/player-level_2026-02-24.csv"
+      ]
+    }
+  },
+  "combo_history": [],
+  "created": "2026-02-24"
+}
