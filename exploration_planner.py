@@ -95,31 +95,70 @@ class Lens:
 
 # ── Lens-specific analysis functions ───────────────────────────────────────────
 
+def _build_player_lookup(sub_df: pd.DataFrame,
+                          player_col: str,
+                          id_col: str) -> dict:
+    """
+    Build a mapping from abbreviated player label → {player_id, posteam}.
+
+    posteam is the team the player appeared for most often in sub_df (mode),
+    which handles mid-season trades gracefully — the dominant team wins.
+    player_id comes from the stable nflverse ID column (e.g. "00-0035228").
+    """
+    if id_col not in sub_df.columns:
+        return {}
+    src = (
+        sub_df[[player_col, id_col, "posteam"]]
+        .dropna(subset=[player_col, id_col, "posteam"])
+        .copy()
+    )
+    src["_label"] = src[player_col].str.strip()
+    lookup = {}
+    for label, grp in src.groupby("_label"):
+        lookup[label] = {
+            "player_id": grp[id_col].iloc[0],           # stable; same for all rows
+            "posteam":   grp["posteam"].mode().iloc[0],  # most common team
+        }
+    return lookup
+
+
 def _player_split_analysis(plays: pd.DataFrame, metrics: list, dims: list,
                             min_attempts: int = 30) -> list:
     """
-    Like run_split_analysis but groups by player name instead of posteam.
+    Like run_split_analysis but groups by player instead of posteam.
     Runs three views: passer, rusher, receiver.
-    Returns findings in the standard format (team field = player name).
+
+    Each returned finding carries three extra fields beyond the standard schema:
+      player_id    — stable nflverse ID (e.g. "00-0035228")
+      player_label — the PBP abbreviated name (e.g. "K.Murray"); same as team
+      posteam      — offensive team abbreviation (e.g. "ARI")
+
+    The 'team' field is kept as the player label for display compatibility with
+    interpret.py, the report writers, and memory_manager fingerprinting.
     """
     findings = []
 
     player_views = [
-        ("passer",   "passer_player_name",   plays[plays["play_type"] == "pass"]),
-        ("rusher",   "rusher_player_name",    plays[plays["play_type"] == "run"]),
-        ("receiver", "receiver_player_name",  plays[plays["play_type"] == "pass"]),
+        ("passer",   "passer_player_name",   "passer_player_id",
+         plays[plays["play_type"] == "pass"]),
+        ("rusher",   "rusher_player_name",    "rusher_player_id",
+         plays[plays["play_type"] == "run"]),
+        ("receiver", "receiver_player_name",  "receiver_player_id",
+         plays[plays["play_type"] == "pass"]),
     ]
 
-    for role, player_col, sub_df in player_views:
+    for role, player_col, id_col, sub_df in player_views:
         if player_col not in sub_df.columns:
             continue
-        sub_df = sub_df.copy()
         sub_df = sub_df[sub_df[player_col].notna()].copy()
         if len(sub_df) < min_attempts * 3:
             continue
 
-        # Replace posteam with player name so run_split_analysis works unchanged
-        sub_df["posteam"] = sub_df[player_col].str.split(",").str[0].str.strip()
+        # Build stable-ID + team lookup BEFORE posteam is overwritten
+        lookup = _build_player_lookup(sub_df, player_col, id_col)
+
+        # Replace posteam with player label so run_split_analysis groups by player
+        sub_df["posteam"] = sub_df[player_col].str.strip()
 
         # Only include players with enough plays
         counts = sub_df["posteam"].value_counts()
@@ -157,9 +196,16 @@ def _player_split_analysis(plays: pd.DataFrame, metrics: list, dims: list,
 
         role_findings = run_split_analysis(sub_df, role_metrics, role_dims,
                                            min_plays=min_attempts)
-        # Tag each finding with the role
+
+        # Enrich each finding: tag role in dimension + attach stable identity fields
         for f in role_findings:
-            f["dimension"] = f"{role}:{f['dimension']}"
+            f["dimension"]    = f"{role}:{f['dimension']}"
+            label             = f["team"]   # player label set by run_split_analysis
+            meta              = lookup.get(label, {})
+            f["player_id"]    = meta.get("player_id", "")
+            f["player_label"] = label
+            f["posteam"]      = meta.get("posteam", "")
+
         findings.extend(role_findings)
 
     return findings
