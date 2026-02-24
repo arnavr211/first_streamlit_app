@@ -99,11 +99,15 @@ def _build_player_lookup(sub_df: pd.DataFrame,
                           player_col: str,
                           id_col: str) -> dict:
     """
-    Build a mapping from abbreviated player label → {player_id, posteam}.
+    Build a mapping from stable player_id → {player_label, posteam}.
 
-    posteam is the team the player appeared for most often in sub_df (mode),
-    which handles mid-season trades gracefully — the dominant team wins.
-    player_id comes from the stable nflverse ID column (e.g. "00-0035228").
+    Keyed by the nflverse GSIS ID (e.g. "00-0035228") so that grouping and
+    lookup are both anchored to the stable identifier, never to the abbreviated
+    display name (which is not unique across seasons or, rarely, within one).
+
+    player_label — most common PBP abbreviated name for that ID.
+    posteam      — team the player appeared for most often (mode), so
+                   mid-season trades are handled gracefully.
     """
     if id_col not in sub_df.columns:
         return {}
@@ -114,10 +118,10 @@ def _build_player_lookup(sub_df: pd.DataFrame,
     )
     src["_label"] = src[player_col].str.strip()
     lookup = {}
-    for label, grp in src.groupby("_label"):
-        lookup[label] = {
-            "player_id": grp[id_col].iloc[0],           # stable; same for all rows
-            "posteam":   grp["posteam"].mode().iloc[0],  # most common team
+    for player_id_val, grp in src.groupby(id_col):
+        lookup[player_id_val] = {
+            "player_label": grp["_label"].mode().iloc[0],   # most common abbrev name
+            "posteam":      grp["posteam"].mode().iloc[0],  # most common team
         }
     return lookup
 
@@ -125,16 +129,23 @@ def _build_player_lookup(sub_df: pd.DataFrame,
 def _player_split_analysis(plays: pd.DataFrame, metrics: list, dims: list,
                             min_attempts: int = 30) -> list:
     """
-    Like run_split_analysis but groups by player instead of posteam.
+    Like run_split_analysis but groups by stable player_id instead of posteam.
     Runs three views: passer, rusher, receiver.
 
-    Each returned finding carries three extra fields beyond the standard schema:
-      player_id    — stable nflverse ID (e.g. "00-0035228")
-      player_label — the PBP abbreviated name (e.g. "K.Murray"); same as team
+    Grouping is always by the nflverse GSIS ID (e.g. "00-0035228"), never by
+    the abbreviated display name. The display name is attached as player_label
+    after grouping for readability. This ensures findings survive player renames
+    and disambiguates players who share abbreviated names.
+
+    Each returned finding carries four extra fields beyond the standard schema:
+      entity_type  — always "player"
+      player_id    — stable nflverse GSIS ID used for grouping
+      player_label — the PBP abbreviated name (e.g. "K.Murray"), for display
       posteam      — offensive team abbreviation (e.g. "ARI")
 
-    The 'team' field is kept as the player label for display compatibility with
+    The 'team' field is set to player_label for display compatibility with
     interpret.py, the report writers, and memory_manager fingerprinting.
+    An AssertionError is raised if any finding ends up with a null player_id.
     """
     findings = []
 
@@ -148,17 +159,19 @@ def _player_split_analysis(plays: pd.DataFrame, metrics: list, dims: list,
     ]
 
     for role, player_col, id_col, sub_df in player_views:
-        if player_col not in sub_df.columns:
+        if player_col not in sub_df.columns or id_col not in sub_df.columns:
             continue
-        sub_df = sub_df[sub_df[player_col].notna()].copy()
+        # Require both name and stable ID to be present
+        sub_df = sub_df[sub_df[player_col].notna() & sub_df[id_col].notna()].copy()
         if len(sub_df) < min_attempts * 3:
             continue
 
-        # Build stable-ID + team lookup BEFORE posteam is overwritten
+        # Build stable-ID lookup BEFORE posteam is overwritten:
+        #   player_id → {player_label, posteam}
         lookup = _build_player_lookup(sub_df, player_col, id_col)
 
-        # Replace posteam with player label so run_split_analysis groups by player
-        sub_df["posteam"] = sub_df[player_col].str.strip()
+        # Replace posteam with player_id so run_split_analysis groups by stable ID
+        sub_df["posteam"] = sub_df[id_col].str.strip()
 
         # Only include players with enough plays
         counts = sub_df["posteam"].value_counts()
@@ -197,16 +210,28 @@ def _player_split_analysis(plays: pd.DataFrame, metrics: list, dims: list,
         role_findings = run_split_analysis(sub_df, role_metrics, role_dims,
                                            min_plays=min_attempts)
 
-        # Enrich each finding: tag role in dimension + attach stable identity fields
+        # Enrich each finding: tag role in dimension + attach stable identity fields.
+        # f["team"] after run_split_analysis is the player_id (what "posteam" was set to).
         for f in role_findings:
             f["dimension"]    = f"{role}:{f['dimension']}"
-            label             = f["team"]   # player label set by run_split_analysis
-            meta              = lookup.get(label, {})
-            f["player_id"]    = meta.get("player_id", "")
-            f["player_label"] = label
+            player_id_val     = f["team"]                    # stable GSIS ID
+            meta              = lookup.get(player_id_val, {})
+            player_label      = meta.get("player_label", player_id_val)  # fall back to ID
+            f["entity_type"]  = "player"
+            f["player_id"]    = player_id_val
+            f["player_label"] = player_label
             f["posteam"]      = meta.get("posteam", "")
+            f["team"]         = player_label   # display compat (interpret.py, reports)
 
         findings.extend(role_findings)
+
+    # Assertion: every player finding must carry a non-empty stable ID
+    null_id_count = sum(1 for f in findings if not f.get("player_id"))
+    if null_id_count:
+        raise AssertionError(
+            f"player-level lens: {null_id_count}/{len(findings)} findings have "
+            f"a null player_id. Check id_col availability in PBP data."
+        )
 
     return findings
 
@@ -750,23 +775,42 @@ def _build_metrics(plays: pd.DataFrame, lens: Lens) -> list:
 
 
 def _findings_to_csv(findings: list, lens_id: str, run_date: str) -> Path:
-    """Rank findings and write to a lens-specific CSV. Returns the output path."""
+    """Rank findings and write to a lens-specific CSV. Returns the output path.
+
+    For player-level lenses the CSV is extended with four identity columns that
+    are absent from team/situation CSVs:
+        entity_type  — "player"
+        player_id    — stable nflverse GSIS ID (e.g. "00-0035228")
+        player_label — PBP abbreviated name (e.g. "K.Murray")
+        posteam      — offensive team abbreviation (e.g. "ARI")
+    These columns are included only when at least one finding carries them,
+    so the schema remains backward-compatible for all other lenses.
+    """
     if not findings:
         print(f"  No findings produced for lens '{lens_id}'")
         return None
 
     df_all = _rank_and_interpret(findings)
 
-    output_cols = [
+    base_cols = [
         "team", "metric", "dimension", "dimension_value",
         "team_value", "league_avg", "std_devs_away",
         "sample_size", "interpretation",
     ]
-    top_df = df_all.head(TOP_N).reset_index()[["rank"] + output_cols]
+    # Append player identity columns when any finding carries them (player lens)
+    _PLAYER_ID_COLS = ["entity_type", "player_id", "player_label", "posteam"]
+    extra_cols = [
+        c for c in _PLAYER_ID_COLS
+        if c in df_all.columns and df_all[c].notna().any()
+    ]
+
+    top_df = df_all.head(TOP_N).reset_index()[["rank"] + base_cols + extra_cols]
 
     out_path = FINDINGS_DIR / f"{lens_id}_{run_date}.csv"
     top_df.to_csv(out_path, index=False)
     print(f"  → {len(df_all)} findings | top {len(top_df)} saved to {out_path.name}")
+    if extra_cols:
+        print(f"     Extended columns: {extra_cols}")
     return out_path
 
 
