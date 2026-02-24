@@ -74,6 +74,10 @@ from nfldiscovery import (
     run_split_analysis,
     _rank_and_interpret,
 )
+from roster_validation import (
+    enrich_and_validate_players,
+    load_rosters,
+)
 import notify
 
 # ── Paths & constants ───────────────────────────────────────────────────────────
@@ -89,6 +93,89 @@ MIN_WEEK_PLAYS = 200
 DELTA_TOP_N = 40
 # Max memory refs per finding in the delta prompt
 MAX_MEMORY_REFS_PER_FINDING = 2
+
+
+# ── Player enrichment ────────────────────────────────────────────────────────────
+
+# Extra prompt instructions when roster validation could not be performed
+_UNVALIDATED_PLAYER_WARNING = """\
+
+⚠️  ROSTER VALIDATION COULD NOT BE PERFORMED  ⚠️
+
+The player-level findings below have NOT been cross-checked against official
+NFL rosters. Some player_id or posteam values may be stale, incorrect, or refer
+to practice-squad / cut players. Apply extra scrutiny:
+
+1. Cross-check any player name against your own knowledge before highlighting.
+2. Be skeptical of findings for players you don't recognize — they may be
+   practice-squad elevations whose sample size inflates their metrics.
+3. Note sample size aggressively; small-sample outliers are more likely to be
+   noise when roster validation is missing.
+"""
+
+
+def _is_player_findings(df: pd.DataFrame) -> bool:
+    """Return True if the findings DataFrame contains player-level data."""
+    if "entity_type" in df.columns:
+        if (df["entity_type"] == "player").any():
+            return True
+    if "player_id" in df.columns:
+        if df["player_id"].notna().any():
+            return True
+    return False
+
+
+def _enrich_player_findings(
+    findings_df: pd.DataFrame,
+    findings_path: Path,
+    seasons: list[int],
+) -> tuple[pd.DataFrame, Path, dict, bool]:
+    """
+    Attempt to load rosters and enrich player-level findings.
+
+    Returns:
+        (enriched_df, enriched_path, validation_summary, roster_loaded)
+
+    If roster loading fails (network error), returns:
+        (original_df, original_path, {}, False)
+    so the pipeline can proceed with a warning.
+    """
+    print("  Detected player-level findings — loading rosters for validation...")
+
+    # ── Load rosters ─────────────────────────────────────────────────────────────
+    rosters_df = None
+    try:
+        rosters_df = load_rosters(seasons)
+        print(f"    Loaded {len(rosters_df):,} roster entries for seasons {seasons}")
+    except Exception as e:
+        print(f"    ⚠️  ROSTER LOAD FAILED: {e}")
+        print("    Proceeding WITHOUT roster enrichment — interpret prompt will include warning")
+        return findings_df, findings_path, {}, False
+
+    # ── Enrich and validate ─────────────────────────────────────────────────────
+    enriched_df, summary = enrich_and_validate_players(
+        findings_df,
+        rosters_df,
+        player_id_col="player_id",
+        posteam_col="posteam",
+        drop_missing=False,   # keep findings even if roster match missing
+        drop_mismatch=False,  # keep findings even if team mismatch
+    )
+
+    # ── Print validation summary ─────────────────────────────────────────────────
+    print(f"    Validation summary:")
+    print(f"      Total findings:        {summary.get('total_rows', len(findings_df))}")
+    print(f"      Roster matched:        {summary.get('matched_rows', 0)}")
+    print(f"      Missing roster match:  {summary.get('missing_rows', 0)}")
+    print(f"      Team mismatch:         {summary.get('mismatch_rows', 0)}")
+
+    # ── Write enriched CSV ───────────────────────────────────────────────────────
+    stem = findings_path.stem  # e.g. "player-level_2026-02-24"
+    enriched_path = findings_path.parent / f"{stem}_ENRICHED.csv"
+    enriched_df.to_csv(enriched_path, index=False)
+    print(f"    Enriched findings → {enriched_path.name}")
+
+    return enriched_df, enriched_path, summary, True
 
 
 # ── Data state ──────────────────────────────────────────────────────────────────
@@ -872,6 +959,14 @@ def main() -> None:
     findings_df = pd.read_csv(findings_path)
     print(f"  Findings loaded: {len(findings_df)} rows from {findings_path.name}")
 
+    # ── Step 3b: Enrich player-level findings with roster data ───────────────────
+    roster_validated = True  # assume True; set False if player findings + roster load fails
+    validation_summary = {}
+
+    if _is_player_findings(findings_df):
+        findings_df, findings_path, validation_summary, roster_validated = \
+            _enrich_player_findings(findings_df, findings_path, seasons)
+
     # Update planner state
     if is_combo:
         la, lb = selected
@@ -918,16 +1013,18 @@ def main() -> None:
         "sent":      len(filtered_df),
         "n_memory":  len(past_insights),
         **filter_counts,
+        **validation_summary,  # includes roster_matched, missing_roster_match, team_mismatch
     }
 
     insights = None
     if not filtered_df.empty and not args.dry_run and not args.skip_api:
-        _, user_prompt = build_prompt(filtered_df, memory_summary,
-                                      n_insights=args.n_insights)
-        system_prompt  = None  # build_prompt returns (system, user); unpack properly
         system_prompt, user_prompt = build_prompt(
             filtered_df, memory_summary, n_insights=args.n_insights
         )
+        # Inject unvalidated-player warning if roster load failed for player findings
+        if _is_player_findings(filtered_df) and not roster_validated:
+            print("  ⚠️  Injecting unvalidated-player warning into prompt")
+            user_prompt = _UNVALIDATED_PLAYER_WARNING + user_prompt
         try:
             raw      = call_claude(system_prompt, user_prompt)
             insights = parse_insights(raw)
