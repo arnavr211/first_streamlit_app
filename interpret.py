@@ -57,7 +57,35 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     translate them into concise, insightful observations about team tendencies,
     scheme design, QB decision-making, and coaching patterns.
 
-    Rules:
+    ════════════════════════════════════════════════════════════════════════════
+    GROUNDING RULES — STRICTLY ENFORCED
+    ════════════════════════════════════════════════════════════════════════════
+
+    You are a statistical analysis engine. Your task is to interpret the
+    findings table strictly from a quantitative standpoint.
+
+    Player Identity:
+    • Player identifiers may be abbreviated (e.g., "T.Thornton").
+    • You MUST NOT expand abbreviations into full names UNLESS roster_full_name
+      is provided in the findings table — then use that EXACT value only.
+    • You MUST NOT infer team membership, position, or background beyond what
+      appears in the table. If roster_team or roster_position columns exist,
+      use those EXACT values. Otherwise, do not mention team or position.
+    • If roster fields are MISSING, refer to the player exactly as player_label
+      (or team column) and do not speculate on identity.
+
+    CRITICAL CONSTRAINTS (MUST FOLLOW):
+    1. Do NOT infer or guess any player team.
+    2. Do NOT infer or guess any player identifiers.
+    3. Only reference player names exactly as they appear in the table.
+    4. Only reference team values exactly as they appear in the roster_team field.
+    5. Do NOT speculate on strategic implications (scheme, coaching, etc.).
+    6. Do NOT introduce any player or team not present in the table.
+    7. If a team is not explicitly listed in the row, do not mention a team.
+
+    ════════════════════════════════════════════════════════════════════════════
+
+    General Rules:
     1. DO NOT repeat or rephrase any insight already listed in the memory section.
     2. For teams that appear in the memory, look for second-order implications
        or deeper connections — not restatements of what is already known.
@@ -75,8 +103,9 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
 _USER_PROMPT_TEMPLATE = """\
 ## New Statistical Findings ({n_new} findings, filtered from {n_total} total)
 
-Each finding is a team-level deviation from league average.
+Each finding is a team-level or player-level deviation from league average.
 Format: team | metric | dimension=value | team_avg vs league_avg | z-score | n
+For player findings, identity fields appear on a continuation line (→).
 
 {findings_block}
 
@@ -92,14 +121,30 @@ Analyze the new findings above. Produce {n_insights} distinct insights.
 Return a JSON array where each element has exactly these keys:
 
   "rank"           : integer, 1 = most surprising
-  "teams"          : list of team abbreviations referenced
+  "teams"          : list of team abbreviations referenced (use roster_team if present,
+                     otherwise posteam; leave empty if neither is available)
   "metrics"        : list of metric names referenced
   "dimensions"     : list of dimension names referenced
   "dimension_values": list of dimension values referenced
+  "evidence"       : object quoting EXACT row values that support this insight:
+                     {{
+                       "team": "<team column value or null>",
+                       "player_label": "<player_label if player finding, else null>",
+                       "roster_full_name": "<roster_full_name if present, else null>",
+                       "metric": "<metric name>",
+                       "dimension": "<dimension name>",
+                       "dimension_value": "<dimension value>"
+                     }}
   "insight_text"   : 2–4 sentences. Lead with the key number. Explain the
                      football implication. Note any caveats (small n, etc.).
+                     For player findings: use roster_full_name if available,
+                     otherwise use player_label EXACTLY as shown. Do NOT expand
+                     abbreviations or infer team/position if not in the table.
   "novelty_reason" : 1 sentence explaining why this is NOT a repeat of
                      anything in the memory section.
+
+CRITICAL: The "evidence" object MUST contain values copied exactly from the table.
+This proves your insight is grounded in the data, not invented.
 
 DO NOT repeat or rephrase any previous insight. Find genuinely new angles,
 deeper connections, or second-order implications of patterns already identified.
@@ -107,18 +152,76 @@ deeper connections, or second-order implications of patterns already identified.
 
 
 def _format_findings_block(df: pd.DataFrame) -> str:
-    """Format the filtered findings DataFrame into a compact prompt block."""
+    """Format the filtered findings DataFrame into a compact prompt block.
+
+    For player-level findings (entity_type == 'player'), includes additional
+    identity columns when present: player_label, player_id, posteam, and
+    roster-grounded fields (roster_full_name, roster_team, roster_position).
+    """
+    # Detect if this is player-level data
+    is_player_data = (
+        ("entity_type" in df.columns and (df["entity_type"] == "player").any()) or
+        ("player_id" in df.columns and df["player_id"].notna().any())
+    )
+
+    # Detect which roster columns are present and populated
+    roster_cols = []
+    for col in ["roster_full_name", "roster_team", "roster_position"]:
+        if col in df.columns and df[col].notna().any():
+            roster_cols.append(col)
+
     lines = []
+
+    # Add header comment for player findings
+    if is_player_data:
+        if roster_cols:
+            lines.append(f"# ROSTER-GROUNDED columns available: {', '.join(roster_cols)}")
+            lines.append("# Use these EXACT values for player identity. Do not expand or infer.")
+        else:
+            lines.append("# WARNING: No roster columns present. Use player_label exactly as shown.")
+            lines.append("# Do NOT expand abbreviations or infer team/position.")
+        lines.append("")
+
     for _, row in df.iterrows():
         direction = "▲" if row["team_value"] > row["league_avg"] else "▼"
         delta = row["team_value"] - row["league_avg"]
-        lines.append(
-            f"  {row['team']:5s} | {row['metric'][:28]:<28} | "
-            f"{row['dimension'][:20]:<20}={str(row['dimension_value'])[:22]:<22} | "
+
+        # Base line: team | metric | dimension=value | stats
+        base = (
+            f"  {str(row['team'])[:12]:<12} | {row['metric'][:24]:<24} | "
+            f"{row['dimension'][:18]:<18}={str(row['dimension_value'])[:18]:<18} | "
             f"team={row['team_value']:>8.3f} vs lg={row['league_avg']:>8.3f} "
             f"({direction}{abs(delta):.3f}) | z={row['std_devs_away']:>6.2f} | "
             f"n={int(row['sample_size'])}"
         )
+
+        # For player findings, add identity fields on a continuation line
+        if is_player_data:
+            identity_parts = []
+
+            # Player label (abbreviated name from PBP)
+            if "player_label" in row.index and pd.notna(row.get("player_label")):
+                identity_parts.append(f"player_label={row['player_label']}")
+
+            # Player ID (stable GSIS ID)
+            if "player_id" in row.index and pd.notna(row.get("player_id")):
+                identity_parts.append(f"player_id={row['player_id']}")
+
+            # Team from PBP (posteam)
+            if "posteam" in row.index and pd.notna(row.get("posteam")):
+                identity_parts.append(f"posteam={row['posteam']}")
+
+            # Roster-grounded fields (authoritative)
+            for col in roster_cols:
+                val = row.get(col)
+                if pd.notna(val) and str(val).strip():
+                    identity_parts.append(f"{col}={val}")
+
+            if identity_parts:
+                base += "\n      → " + " | ".join(identity_parts)
+
+        lines.append(base)
+
     return "\n".join(lines)
 
 
