@@ -294,6 +294,169 @@ def parse_insights(raw_response: str) -> list[dict]:
     return json.loads(text[start:end])
 
 
+# ── Team Lock Post-Processing ─────────────────────────────────────────────────
+
+def build_team_mapping(df: pd.DataFrame) -> dict[str, str]:
+    """
+    Build an authoritative player-name → team mapping from the findings table.
+
+    Priority for player key:
+      1. roster_full_name (canonical)
+      2. player_label (abbreviated)
+
+    Priority for team value:
+      1. roster_team (canonical)
+      2. posteam (from PBP)
+
+    Returns a dict mapping normalized player names to team abbreviations.
+    Multiple name forms for the same player are all included as keys.
+    """
+    mapping = {}
+
+    for _, row in df.iterrows():
+        # Determine the canonical team
+        team = None
+        for col in ["roster_team", "posteam"]:
+            if col in row.index and pd.notna(row.get(col)):
+                team = str(row[col]).strip().upper()
+                break
+
+        if not team:
+            continue  # No team info for this row
+
+        # Add all available name forms as keys
+        name_cols = ["roster_full_name", "player_label"]
+        for col in name_cols:
+            if col in row.index and pd.notna(row.get(col)):
+                name = str(row[col]).strip()
+                if name:
+                    # Store both original and normalized forms
+                    mapping[name] = team
+                    mapping[name.lower()] = team
+                    # Also store without periods (e.g., "T.Thornton" -> "TThornton")
+                    mapping[name.replace(".", "")] = team
+                    mapping[name.replace(".", "").lower()] = team
+
+        # Also map team abbreviation to itself (for team-level findings)
+        if "team" in row.index and pd.notna(row.get("team")):
+            team_val = str(row["team"]).strip().upper()
+            if team_val and len(team_val) <= 4:  # Looks like a team abbrev
+                mapping[team_val] = team_val
+
+    return mapping
+
+
+def _normalize_name(name: str) -> list[str]:
+    """
+    Generate normalized forms of a player name for matching.
+    Returns a list of candidate keys to try in the mapping.
+    """
+    if not name:
+        return []
+
+    candidates = [
+        name,
+        name.lower(),
+        name.replace(".", ""),
+        name.replace(".", "").lower(),
+        name.replace(" ", ""),
+        name.replace(" ", "").lower(),
+    ]
+    return candidates
+
+
+def _extract_player_names_from_insight(insight: dict) -> list[str]:
+    """
+    Extract player/entity names from an insight dict.
+    Checks common keys where names might appear.
+    """
+    names = []
+
+    # Check evidence block first (most authoritative)
+    evidence = insight.get("evidence", {})
+    if isinstance(evidence, dict):
+        for key in ["roster_full_name", "player_label"]:
+            val = evidence.get(key)
+            if val and val != "null":
+                names.append(str(val))
+
+    # Check other common keys
+    for key in ["player", "player_name", "name", "entity"]:
+        val = insight.get(key)
+        if val and isinstance(val, str):
+            names.append(val)
+
+    return names
+
+
+def apply_team_lock(
+    insights: list[dict],
+    team_mapping: dict[str, str],
+    verbose: bool = False,
+) -> tuple[list[dict], int]:
+    """
+    Post-process insights to enforce correct team values from the findings table.
+
+    For each insight:
+    - Extract player names from evidence and other fields
+    - Look up the authoritative team in team_mapping
+    - Overwrite insight["teams"] with the locked value
+    - Set insight["team_locked"] = True if successful, False otherwise
+
+    Returns: (modified insights list, count of insights with team overwritten)
+    """
+    overwritten_count = 0
+
+    for insight in insights:
+        locked_teams = set()
+        found_match = False
+
+        # Try to match player names to authoritative teams
+        player_names = _extract_player_names_from_insight(insight)
+
+        for name in player_names:
+            for candidate in _normalize_name(name):
+                if candidate in team_mapping:
+                    locked_teams.add(team_mapping[candidate])
+                    found_match = True
+                    break
+
+        # Also check the existing teams list - validate/correct them
+        existing_teams = insight.get("teams", [])
+        if isinstance(existing_teams, list):
+            for t in existing_teams:
+                t_upper = str(t).strip().upper()
+                if t_upper in team_mapping:
+                    locked_teams.add(team_mapping[t_upper])
+                    found_match = True
+
+        # Apply the lock
+        if found_match and locked_teams:
+            old_teams = insight.get("teams", [])
+            new_teams = sorted(locked_teams)
+
+            # Check if we're actually changing anything
+            if set(t.upper() for t in old_teams if t) != locked_teams:
+                overwritten_count += 1
+                if verbose:
+                    print(f"  TEAM LOCK: {old_teams} → {new_teams}")
+
+            insight["teams"] = new_teams
+            insight["team_locked"] = True
+        else:
+            # Could not match - set team to empty and flag as unlocked
+            if insight.get("teams"):
+                if verbose:
+                    print(f"  TEAM LOCK FAILED: no match for {player_names}, "
+                          f"clearing teams={insight.get('teams')}")
+                overwritten_count += 1
+
+            insight["teams"] = []
+            insight["team_locked"] = False
+
+    return insights, overwritten_count
+
+
 # ── Filtering ──────────────────────────────────────────────────────────────────
 
 def filter_findings(
@@ -404,6 +567,8 @@ def main() -> None:
                         help="Print the prompt but do not call the API")
     parser.add_argument("--show-memory", action="store_true",
                         help="Print the current memory summary and exit")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show detailed debug output (e.g., team lock operations)")
     args = parser.parse_args()
 
     # ── Memory ──────────────────────────────────────────────────────────────────
@@ -478,6 +643,19 @@ def main() -> None:
         print("Raw response saved to interpret_raw_response.txt")
         Path("interpret_raw_response.txt").write_text(raw_response)
         sys.exit(1)
+
+    # ── Apply Team Lock ───────────────────────────────────────────────────────────
+    # Build authoritative player→team mapping from findings table
+    team_mapping = build_team_mapping(filtered_df)
+    if args.verbose:
+        print(f"\nTeam mapping built: {len(team_mapping)} entries")
+
+    # Enforce correct teams on all insights
+    insights, n_overwritten = apply_team_lock(
+        insights, team_mapping, verbose=args.verbose
+    )
+    if n_overwritten > 0:
+        print(f"  TEAM LOCK: {n_overwritten} insight(s) had team field corrected")
 
     display_insights(insights)
 
