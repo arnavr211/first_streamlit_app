@@ -52,60 +52,46 @@ FINDINGS_PER_PROMPT  = 30
 # ── Prompt assembly ────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
-    You are an elite NFL analytics expert. You receive statistically flagged
-    findings from a 2025 play-by-play analysis engine and your job is to
-    translate them into concise, insightful observations about team tendencies,
-    scheme design, QB decision-making, and coaching patterns.
+    You are an NFL analytics interpreter. You receive statistically flagged
+    findings from a 2025 play-by-play analysis engine. Each finding has a
+    canonical entity_key that uniquely identifies the player or team.
 
     ════════════════════════════════════════════════════════════════════════════
-    GROUNDING RULES — STRICTLY ENFORCED
+    CRITICAL: ENTITY-KEY BASED RESPONSES
     ════════════════════════════════════════════════════════════════════════════
 
-    You are a statistical analysis engine. Your task is to interpret the
-    findings table strictly from a quantitative standpoint.
+    You are NOT the source of truth for identity fields.
 
-    Player Identity:
-    • Player identifiers may be abbreviated (e.g., "T.Thornton").
-    • You MUST NOT expand abbreviations into full names UNLESS roster_full_name
-      is provided in the findings table — then use that EXACT value only.
-    • You MUST NOT infer team membership, position, or background beyond what
-      appears in the table. If roster_team or roster_position columns exist,
-      use those EXACT values. Otherwise, do not mention team or position.
-    • If roster fields are MISSING, refer to the player exactly as player_label
-      (or team column) and do not speculate on identity.
+    Each finding is tagged with an entity_key in brackets: [Name|Team|Position]
+    You MUST return this exact entity_key in your response. The post-processor
+    will use it to look up canonical identity fields from the authoritative
+    registry. You do NOT need to include player name, team, or position in
+    your response — they will be filled in automatically.
 
-    CRITICAL CONSTRAINTS (MUST FOLLOW):
-    1. Do NOT infer or guess any player team.
-    2. Do NOT infer or guess any player identifiers.
-    3. Only reference player names exactly as they appear in the table.
-    4. Only reference team values exactly as they appear in the roster_team field.
-    5. Do NOT speculate on strategic implications (scheme, coaching, etc.).
-    6. Do NOT introduce any player or team not present in the table.
-    7. If a team is not explicitly listed in the row, do not mention a team.
+    WHAT TO RETURN:
+    • entity_key: EXACT string from the finding (e.g., "Tyquan Thornton|KC|WR")
+    • interpretation: Your analytical insight about this finding
+
+    WHAT NOT TO RETURN:
+    • Do NOT return player name, team, or position separately
+    • Do NOT infer or expand any identity information
+    • Do NOT mention teams or players not present in the findings
 
     ════════════════════════════════════════════════════════════════════════════
 
     General Rules:
     1. DO NOT repeat or rephrase any insight already listed in the memory section.
-    2. For teams that appear in the memory, look for second-order implications
-       or deeper connections — not restatements of what is already known.
-    3. Every claim must be grounded in at least one specific statistic from the
-       findings provided (cite team, metric, value, and sample size).
-    4. Rank insights by analytical surprise: findings that are counterintuitive,
-       that suggest hidden structure, or that connect multiple patterns together
-       should rank higher than findings that simply confirm existing narratives.
-    5. For correlation findings (where the metric is "corr(X, Y)"), explain what
-       it means that the relationship between X and Y is stronger or weaker than
-       the league norm for this team.
-    6. Output ONLY a JSON array — no prose outside the JSON.
+    2. Every claim must be grounded in at least one specific statistic from the
+       findings provided (cite metric, value, and sample size).
+    3. Rank insights by analytical surprise: counterintuitive findings rank higher.
+    4. Output ONLY a JSON array — no prose outside the JSON.
 """)
 
 _USER_PROMPT_TEMPLATE = """\
 ## New Statistical Findings ({n_new} findings, filtered from {n_total} total)
 
-Each finding is a team-level or player-level deviation from league average.
-Format: team | metric | dimension=value | team_avg vs league_avg | z-score | n
-For player findings, identity fields appear on a continuation line (→).
+Each finding is keyed by entity_key in brackets: [Name|Team|Position]
+You MUST return this exact entity_key — identity fields will be filled in later.
 
 {findings_block}
 
@@ -117,46 +103,45 @@ For player findings, identity fields appear on a continuation line (→).
 
 ## Your Task
 
-Analyze the new findings above. Produce {n_insights} distinct insights.
-Return a JSON array where each element has exactly these keys:
+Analyze the findings above. Produce {n_insights} distinct insights.
+Return a JSON array where each element has EXACTLY these keys:
 
   "rank"           : integer, 1 = most surprising
-  "teams"          : list of team abbreviations referenced (use roster_team if present,
-                     otherwise posteam; leave empty if neither is available)
+  "entity_key"     : EXACT string from brackets, e.g. "Tyquan Thornton|KC|WR"
+                     For team-level findings: "|KC|" or similar
   "metrics"        : list of metric names referenced
-  "dimensions"     : list of dimension names referenced
-  "dimension_values": list of dimension values referenced
-  "evidence"       : object quoting EXACT row values that support this insight:
-                     {{
-                       "team": "<team column value or null>",
-                       "player_label": "<player_label if player finding, else null>",
-                       "roster_full_name": "<roster_full_name if present, else null>",
-                       "metric": "<metric name>",
-                       "dimension": "<dimension name>",
-                       "dimension_value": "<dimension value>"
-                     }}
-  "insight_text"   : 2–4 sentences. Lead with the key number. Explain the
-                     football implication. Note any caveats (small n, etc.).
-                     For player findings: use roster_full_name if available,
-                     otherwise use player_label EXACTLY as shown. Do NOT expand
-                     abbreviations or infer team/position if not in the table.
+  "interpretation" : 2–4 sentences. Lead with the key statistic.
+                     Do NOT include player name, team, or position — these will
+                     be filled from the canonical registry using entity_key.
+                     Focus purely on what the numbers mean analytically.
   "novelty_reason" : 1 sentence explaining why this is NOT a repeat of
                      anything in the memory section.
 
-CRITICAL: The "evidence" object MUST contain values copied exactly from the table.
-This proves your insight is grounded in the data, not invented.
+CRITICAL RULES:
+1. The entity_key MUST be copied EXACTLY from the finding (including case and pipes)
+2. Do NOT invent entity_keys or modify them in any way
+3. Do NOT mention player names or teams in interpretation — use "this player" or
+   "this entity" since identity will be injected from the registry
+4. Do NOT repeat or rephrase any previous insight
 
-DO NOT repeat or rephrase any previous insight. Find genuinely new angles,
-deeper connections, or second-order implications of patterns already identified.
+Example response format:
+[
+  {{
+    "rank": 1,
+    "entity_key": "Tyquan Thornton|KC|WR",
+    "metrics": ["air_yards"],
+    "interpretation": "This receiver averages 27.1 air yards in shotgun formations, dramatically higher than the league average of 8.1 (z=11.55, n=36). This suggests a deep-threat role with high average depth of target.",
+    "novelty_reason": "First observation of this specific shotgun air yards pattern."
+  }}
+]
 """
 
 
-def _format_findings_block(df: pd.DataFrame) -> str:
+def _format_findings_block(df: pd.DataFrame, registry: dict[str, dict] = None) -> str:
     """Format the filtered findings DataFrame into a compact prompt block.
 
-    For player-level findings (entity_type == 'player'), includes additional
-    identity columns when present: player_label, player_id, posteam, and
-    roster-grounded fields (roster_full_name, roster_team, roster_position).
+    For player-level findings, includes the entity_key for each row.
+    The entity_key is the canonical identifier that Claude must return.
     """
     # Detect if this is player-level data
     is_player_data = (
@@ -164,61 +149,50 @@ def _format_findings_block(df: pd.DataFrame) -> str:
         ("player_id" in df.columns and df["player_id"].notna().any())
     )
 
-    # Detect which roster columns are present and populated
-    roster_cols = []
-    for col in ["roster_full_name", "roster_team", "roster_position"]:
-        if col in df.columns and df[col].notna().any():
-            roster_cols.append(col)
-
     lines = []
 
-    # Add header comment for player findings
-    if is_player_data:
-        if roster_cols:
-            lines.append(f"# ROSTER-GROUNDED columns available: {', '.join(roster_cols)}")
-            lines.append("# Use these EXACT values for player identity. Do not expand or infer.")
-        else:
-            lines.append("# WARNING: No roster columns present. Use player_label exactly as shown.")
-            lines.append("# Do NOT expand abbreviations or infer team/position.")
-        lines.append("")
+    # Add header explaining entity_key system
+    lines.append("# ENTITY-KEYED FINDINGS")
+    lines.append("# Each finding has an entity_key you MUST return in your response.")
+    lines.append("# Do NOT invent or modify identity fields - use entity_key to reference findings.")
+    lines.append("")
 
     for _, row in df.iterrows():
         direction = "▲" if row["team_value"] > row["league_avg"] else "▼"
         delta = row["team_value"] - row["league_avg"]
 
-        # Base line: team | metric | dimension=value | stats
+        # Build entity_key for this row
+        roster_name = row.get("roster_full_name") if "roster_full_name" in row.index else None
+        roster_team = row.get("roster_team") if "roster_team" in row.index else None
+        roster_pos = row.get("roster_position") if "roster_position" in row.index else None
+
+        roster_name = str(roster_name).strip() if pd.notna(roster_name) else ""
+        roster_team = str(roster_team).strip().upper() if pd.notna(roster_team) else ""
+        roster_pos = str(roster_pos).strip().upper() if pd.notna(roster_pos) else ""
+
+        # Fallback to posteam
+        if not roster_team and "posteam" in row.index and pd.notna(row.get("posteam")):
+            roster_team = str(row["posteam"]).strip().upper()
+
+        if roster_name:
+            entity_key = f"{roster_name}|{roster_team}|{roster_pos}"
+        else:
+            team_col = row.get("team") if "team" in row.index else None
+            if pd.notna(team_col):
+                team_val = str(team_col).strip().upper()
+                entity_key = f"|{team_val}|" if len(team_val) <= 4 else f"|UNKNOWN|"
+            else:
+                entity_key = "|UNKNOWN|"
+
+        # Base line: entity_key | metric | dimension=value | stats
         base = (
-            f"  {str(row['team'])[:12]:<12} | {row['metric'][:24]:<24} | "
-            f"{row['dimension'][:18]:<18}={str(row['dimension_value'])[:18]:<18} | "
-            f"team={row['team_value']:>8.3f} vs lg={row['league_avg']:>8.3f} "
-            f"({direction}{abs(delta):.3f}) | z={row['std_devs_away']:>6.2f} | "
+            f"  [{entity_key}]\n"
+            f"    metric={row['metric']} | "
+            f"{row['dimension']}={row['dimension_value']} | "
+            f"value={row['team_value']:.3f} vs league={row['league_avg']:.3f} "
+            f"({direction}{abs(delta):.3f}) | z={row['std_devs_away']:.2f} | "
             f"n={int(row['sample_size'])}"
         )
-
-        # For player findings, add identity fields on a continuation line
-        if is_player_data:
-            identity_parts = []
-
-            # Player label (abbreviated name from PBP)
-            if "player_label" in row.index and pd.notna(row.get("player_label")):
-                identity_parts.append(f"player_label={row['player_label']}")
-
-            # Player ID (stable GSIS ID)
-            if "player_id" in row.index and pd.notna(row.get("player_id")):
-                identity_parts.append(f"player_id={row['player_id']}")
-
-            # Team from PBP (posteam)
-            if "posteam" in row.index and pd.notna(row.get("posteam")):
-                identity_parts.append(f"posteam={row['posteam']}")
-
-            # Roster-grounded fields (authoritative)
-            for col in roster_cols:
-                val = row.get(col)
-                if pd.notna(val) and str(val).strip():
-                    identity_parts.append(f"{col}={val}")
-
-            if identity_parts:
-                base += "\n      → " + " | ".join(identity_parts)
 
         lines.append(base)
 
@@ -228,10 +202,11 @@ def _format_findings_block(df: pd.DataFrame) -> str:
 def build_prompt(
     findings_df: pd.DataFrame,
     memory_summary: str,
+    registry: dict[str, dict] = None,
     n_insights: int = 10,
 ) -> tuple[str, str]:
     """Return (system_prompt, user_prompt) ready for the API call."""
-    findings_block = _format_findings_block(findings_df)
+    findings_block = _format_findings_block(findings_df, registry)
 
     memory_section = memory_summary if memory_summary else (
         "## No Previous Insights\n\n"
@@ -294,167 +269,257 @@ def parse_insights(raw_response: str) -> list[dict]:
     return json.loads(text[start:end])
 
 
-# ── Team Lock Post-Processing ─────────────────────────────────────────────────
+# ── Entity Registry & Identity Lock ───────────────────────────────────────────
 
-def build_team_mapping(df: pd.DataFrame) -> dict[str, str]:
+def build_entity_registry(df: pd.DataFrame) -> dict[str, dict]:
     """
-    Build an authoritative player-name → team mapping from the findings table.
+    Build a canonical entity registry from the enriched findings DataFrame.
 
-    Priority for player key:
-      1. roster_full_name (canonical)
-      2. player_label (abbreviated)
+    Each entity is keyed by: roster_full_name|roster_team|roster_position
+    For team-level findings (no player), key is: |team|
 
-    Priority for team value:
-      1. roster_team (canonical)
-      2. posteam (from PBP)
-
-    Returns a dict mapping normalized player names to team abbreviations.
-    Multiple name forms for the same player are all included as keys.
+    Returns a dict mapping entity_key -> canonical row data.
     """
-    mapping = {}
+    registry = {}
 
-    for _, row in df.iterrows():
-        # Determine the canonical team
-        team = None
-        for col in ["roster_team", "posteam"]:
-            if col in row.index and pd.notna(row.get(col)):
-                team = str(row[col]).strip().upper()
-                break
+    for idx, row in df.iterrows():
+        # Determine if this is a player-level or team-level finding
+        roster_name = row.get("roster_full_name") if "roster_full_name" in row.index else None
+        roster_team = row.get("roster_team") if "roster_team" in row.index else None
+        roster_pos = row.get("roster_position") if "roster_position" in row.index else None
 
-        if not team:
-            continue  # No team info for this row
+        # Normalize values
+        roster_name = str(roster_name).strip() if pd.notna(roster_name) else ""
+        roster_team = str(roster_team).strip().upper() if pd.notna(roster_team) else ""
+        roster_pos = str(roster_pos).strip().upper() if pd.notna(roster_pos) else ""
 
-        # Add all available name forms as keys
-        name_cols = ["roster_full_name", "player_label"]
-        for col in name_cols:
-            if col in row.index and pd.notna(row.get(col)):
-                name = str(row[col]).strip()
-                if name:
-                    # Store both original and normalized forms
-                    mapping[name] = team
-                    mapping[name.lower()] = team
-                    # Also store without periods (e.g., "T.Thornton" -> "TThornton")
-                    mapping[name.replace(".", "")] = team
-                    mapping[name.replace(".", "").lower()] = team
+        # Fallback to posteam if roster_team missing
+        if not roster_team and "posteam" in row.index and pd.notna(row.get("posteam")):
+            roster_team = str(row["posteam"]).strip().upper()
 
-        # Also map team abbreviation to itself (for team-level findings)
-        if "team" in row.index and pd.notna(row.get("team")):
-            team_val = str(row["team"]).strip().upper()
-            if team_val and len(team_val) <= 4:  # Looks like a team abbrev
-                mapping[team_val] = team_val
+        # For team-level findings (no player name)
+        if not roster_name:
+            team_col = row.get("team") if "team" in row.index else None
+            if pd.notna(team_col):
+                team_val = str(team_col).strip().upper()
+                if len(team_val) <= 4:  # Looks like team abbrev
+                    entity_key = f"|{team_val}|"
+                else:
+                    continue  # Skip rows we can't key
+            else:
+                continue
+        else:
+            entity_key = f"{roster_name}|{roster_team}|{roster_pos}"
 
-    return mapping
+        # Store canonical data for this entity
+        canonical = {
+            "entity_key": entity_key,
+            "roster_full_name": roster_name if roster_name else None,
+            "roster_team": roster_team if roster_team else None,
+            "roster_position": roster_pos if roster_pos else None,
+            "player_label": row.get("player_label") if "player_label" in row.index else None,
+            "metric": row.get("metric"),
+            "dimension": row.get("dimension"),
+            "dimension_value": row.get("dimension_value"),
+            "team_value": row.get("team_value"),
+            "league_avg": row.get("league_avg"),
+            "std_devs_away": row.get("std_devs_away"),
+            "sample_size": row.get("sample_size"),
+            "_row_idx": idx,
+        }
+
+        # Keep first occurrence if duplicate key
+        if entity_key not in registry:
+            registry[entity_key] = canonical
+
+    return registry
 
 
-def _normalize_name(name: str) -> list[str]:
+def _normalize_entity_key(key: str) -> list[str]:
     """
-    Generate normalized forms of a player name for matching.
-    Returns a list of candidate keys to try in the mapping.
+    Generate normalized forms of an entity_key for fuzzy matching.
+    Returns candidate keys to try in the registry.
     """
-    if not name:
+    if not key:
         return []
 
-    candidates = [
-        name,
-        name.lower(),
-        name.replace(".", ""),
-        name.replace(".", "").lower(),
-        name.replace(" ", ""),
-        name.replace(" ", "").lower(),
-    ]
+    candidates = [key]
+
+    # Try lowercase version
+    candidates.append(key.lower())
+
+    # Parse and normalize components
+    parts = key.split("|")
+    if len(parts) == 3:
+        name, team, pos = parts
+        # Try with uppercase team/pos
+        candidates.append(f"{name}|{team.upper()}|{pos.upper()}")
+        # Try with stripped whitespace
+        candidates.append(f"{name.strip()}|{team.strip()}|{pos.strip()}")
+
     return candidates
 
 
-def _extract_player_names_from_insight(insight: dict) -> list[str]:
-    """
-    Extract player/entity names from an insight dict.
-    Checks common keys where names might appear.
-    """
-    names = []
-
-    # Check evidence block first (most authoritative)
-    evidence = insight.get("evidence", {})
-    if isinstance(evidence, dict):
-        for key in ["roster_full_name", "player_label"]:
-            val = evidence.get(key)
-            if val and val != "null":
-                names.append(str(val))
-
-    # Check other common keys
-    for key in ["player", "player_name", "name", "entity"]:
-        val = insight.get(key)
-        if val and isinstance(val, str):
-            names.append(val)
-
-    return names
-
-
-def apply_team_lock(
+def apply_identity_lock(
     insights: list[dict],
-    team_mapping: dict[str, str],
+    registry: dict[str, dict],
     verbose: bool = False,
-) -> tuple[list[dict], int]:
+) -> tuple[list[dict], list[dict], dict]:
     """
-    Post-process insights to enforce correct team values from the findings table.
+    Post-process insights to enforce canonical identity from the entity registry.
 
     For each insight:
-    - Extract player names from evidence and other fields
-    - Look up the authoritative team in team_mapping
-    - Overwrite insight["teams"] with the locked value
-    - Set insight["team_locked"] = True if successful, False otherwise
+    - Extract entity_key (or infer from evidence fields)
+    - Look up in registry
+    - Overwrite all identity fields from canonical data
+    - Flag as identity_locked=True/False
 
-    Returns: (modified insights list, count of insights with team overwritten)
+    Returns:
+        (valid_insights, quarantined_insights, stats_dict)
+
+    stats_dict contains: {"locked": N, "quarantined": M, "overwritten": K}
     """
-    overwritten_count = 0
+    valid = []
+    quarantined = []
+    stats = {"locked": 0, "quarantined": 0, "overwritten": 0}
 
     for insight in insights:
-        locked_teams = set()
-        found_match = False
+        entity_key = insight.get("entity_key")
+        matched_entry = None
 
-        # Try to match player names to authoritative teams
-        player_names = _extract_player_names_from_insight(insight)
-
-        for name in player_names:
-            for candidate in _normalize_name(name):
-                if candidate in team_mapping:
-                    locked_teams.add(team_mapping[candidate])
-                    found_match = True
+        # Try to find in registry
+        if entity_key:
+            for candidate in _normalize_entity_key(entity_key):
+                if candidate in registry:
+                    matched_entry = registry[candidate]
                     break
 
-        # Also check the existing teams list - validate/correct them
-        existing_teams = insight.get("teams", [])
-        if isinstance(existing_teams, list):
-            for t in existing_teams:
-                t_upper = str(t).strip().upper()
-                if t_upper in team_mapping:
-                    locked_teams.add(team_mapping[t_upper])
-                    found_match = True
+        # Fallback: try to match from evidence fields
+        if not matched_entry:
+            evidence = insight.get("evidence", {})
+            if isinstance(evidence, dict):
+                # Try to reconstruct entity_key from evidence
+                ev_name = evidence.get("roster_full_name") or ""
+                ev_team = evidence.get("roster_team") or evidence.get("team") or ""
+                ev_pos = ""  # Position rarely in evidence
 
-        # Apply the lock
-        if found_match and locked_teams:
+                if ev_name and ev_name != "null":
+                    # Try exact match first
+                    reconstructed = f"{ev_name}|{ev_team.upper()}|{ev_pos}"
+                    for reg_key, reg_val in registry.items():
+                        if reg_val.get("roster_full_name") == ev_name:
+                            matched_entry = reg_val
+                            break
+
+                # Fallback for team-level findings
+                if not matched_entry and not ev_name:
+                    team_key = f"|{ev_team.upper()}|"
+                    if team_key in registry:
+                        matched_entry = registry[team_key]
+
+        # Apply identity lock
+        if matched_entry:
+            # Track if we're overwriting anything
             old_teams = insight.get("teams", [])
-            new_teams = sorted(locked_teams)
+            new_team = matched_entry.get("roster_team")
 
-            # Check if we're actually changing anything
-            if set(t.upper() for t in old_teams if t) != locked_teams:
-                overwritten_count += 1
-                if verbose:
-                    print(f"  TEAM LOCK: {old_teams} → {new_teams}")
+            if new_team:
+                new_teams = [new_team]
+                if old_teams and set(t.upper() for t in old_teams if t) != {new_team}:
+                    stats["overwritten"] += 1
+                    if verbose:
+                        print(f"  IDENTITY LOCK: teams {old_teams} → {new_teams}")
+            else:
+                new_teams = old_teams  # Keep existing if no canonical team
 
+            # Overwrite all identity fields from canonical registry
+            insight["entity_key"] = matched_entry["entity_key"]
+            insight["roster_full_name"] = matched_entry.get("roster_full_name")
+            insight["roster_team"] = matched_entry.get("roster_team")
+            insight["roster_position"] = matched_entry.get("roster_position")
             insight["teams"] = new_teams
-            insight["team_locked"] = True
+            insight["canonical_metric"] = matched_entry.get("metric")
+            insight["canonical_sample_size"] = matched_entry.get("sample_size")
+            insight["identity_locked"] = True
+
+            stats["locked"] += 1
+            valid.append(insight)
+
         else:
-            # Could not match - set team to empty and flag as unlocked
-            if insight.get("teams"):
-                if verbose:
-                    print(f"  TEAM LOCK FAILED: no match for {player_names}, "
-                          f"clearing teams={insight.get('teams')}")
-                overwritten_count += 1
+            # Quarantine: entity_key not in registry
+            insight["identity_locked"] = False
+            insight["quarantine_reason"] = "entity_key not found in registry"
+            stats["quarantined"] += 1
 
-            insight["teams"] = []
-            insight["team_locked"] = False
+            if verbose:
+                print(f"  QUARANTINED: entity_key={entity_key!r}, "
+                      f"evidence={insight.get('evidence', {})}")
 
-    return insights, overwritten_count
+            quarantined.append(insight)
+
+    return valid, quarantined, stats
+
+
+def validate_insights(
+    insights: list[dict],
+    registry: dict[str, dict],
+    verbose: bool = False,
+) -> tuple[list[dict], list[str]]:
+    """
+    Final validation before report writing.
+
+    Checks:
+    - Every insight has a valid entity_key
+    - Every rendered player/team/position matches canonical registry values
+
+    Returns: (validated_insights, list of validation_errors)
+    """
+    validated = []
+    errors = []
+
+    for i, insight in enumerate(insights):
+        entity_key = insight.get("entity_key")
+        is_valid = True
+
+        # Check 1: entity_key exists
+        if not entity_key:
+            errors.append(f"Insight #{i+1}: missing entity_key")
+            is_valid = False
+            continue
+
+        # Check 2: entity_key in registry
+        if entity_key not in registry:
+            # Try normalized forms
+            found = False
+            for candidate in _normalize_entity_key(entity_key):
+                if candidate in registry:
+                    found = True
+                    break
+            if not found:
+                errors.append(f"Insight #{i+1}: entity_key '{entity_key}' not in registry")
+                is_valid = False
+                continue
+
+        # Check 3: identity fields match registry
+        canonical = registry.get(entity_key)
+        if canonical:
+            for field in ["roster_full_name", "roster_team", "roster_position"]:
+                insight_val = insight.get(field)
+                canonical_val = canonical.get(field)
+                if insight_val and canonical_val and insight_val != canonical_val:
+                    errors.append(
+                        f"Insight #{i+1}: {field} mismatch: "
+                        f"'{insight_val}' vs canonical '{canonical_val}'"
+                    )
+                    # Auto-correct
+                    insight[field] = canonical_val
+
+        if is_valid:
+            validated.append(insight)
+        elif verbose:
+            print(f"  VALIDATION FAILED: Insight #{i+1}")
+
+    return validated, errors
 
 
 # ── Filtering ──────────────────────────────────────────────────────────────────
@@ -495,29 +560,30 @@ def log_insights_from_response(
     insights: list[dict],
     session_id: str,
 ) -> int:
-    """Log each insight to the JSONL. Returns count of insights logged."""
+    """Log each insight to the JSONL. Uses identity-locked fields from registry."""
     logged = 0
     for item in insights:
-        teams           = item.get("teams", [])
-        metrics         = item.get("metrics", [])
-        dimensions      = item.get("dimensions", [])
-        dimension_values= item.get("dimension_values", [])
-        insight_text    = item.get("insight_text", "")
+        # Use LOCKED identity fields (from canonical registry)
+        team = item.get("roster_team") or (item.get("teams", [None])[0] if item.get("teams") else "MULTI")
+        metrics = item.get("metrics", [])
+
+        # Use interpretation field (new schema) or fall back to insight_text
+        insight_text = item.get("interpretation") or item.get("insight_text", "")
 
         if not insight_text:
             continue
 
         log_from_finding_row(
             row = {
-                "team":            teams[0] if teams else "MULTI",
+                "team":            team,
                 "metric":          metrics[0] if metrics else "mixed",
-                "dimension":       dimensions[0] if dimensions else "mixed",
-                "dimension_value": dimension_values[0] if dimension_values else "",
+                "dimension":       "entity_key",
+                "dimension_value": item.get("entity_key", ""),
                 "finding_type":    "interpreted",
                 "team_value":      None,
                 "league_avg":      None,
                 "std_devs_away":   None,
-                "sample_size":     None,
+                "sample_size":     item.get("canonical_sample_size"),
             },
             insight_text = insight_text,
             session_id   = session_id,
@@ -529,21 +595,50 @@ def log_insights_from_response(
 
 # ── Display ────────────────────────────────────────────────────────────────────
 
-def display_insights(insights: list[dict]) -> None:
-    """Print insights to stdout in a clean, readable format."""
+def display_insights(insights: list[dict], quarantined: list[dict] = None) -> None:
+    """Print insights to stdout in a clean, readable format.
+
+    Uses identity-locked fields (roster_full_name, roster_team, roster_position)
+    from the canonical registry, NOT Claude-authored values.
+    """
     print(f"\n{'='*80}")
-    print(f"INTERPRETED INSIGHTS  ({len(insights)} total)")
+    print(f"INTERPRETED INSIGHTS  ({len(insights)} valid)")
+    if quarantined:
+        print(f"  ({len(quarantined)} quarantined - invalid entity_key)")
     print(f"{'='*80}\n")
 
     for item in sorted(insights, key=lambda x: x.get("rank", 99)):
-        rank   = item.get("rank", "?")
-        teams  = ", ".join(item.get("teams", []))
-        mets   = ", ".join(item.get("metrics", []))
-        text   = item.get("insight_text", "")
-        novelty= item.get("novelty_reason", "")
+        rank = item.get("rank", "?")
 
-        print(f"#{rank}  [{teams}]  {mets}")
+        # Use LOCKED identity fields from registry (NOT Claude-authored)
+        player = item.get("roster_full_name") or ""
+        team = item.get("roster_team") or ""
+        position = item.get("roster_position") or ""
+
+        # Build identity string from locked values
+        if player:
+            identity = f"{player}"
+            if team:
+                identity += f" ({team}"
+                if position:
+                    identity += f", {position}"
+                identity += ")"
+        elif team:
+            identity = team
+        else:
+            identity = item.get("entity_key", "UNKNOWN")
+
+        mets = ", ".join(item.get("metrics", []))
+
+        # Use interpretation field (new schema) or fall back to insight_text
+        text = item.get("interpretation") or item.get("insight_text", "")
+        novelty = item.get("novelty_reason", "")
+
+        # Header shows locked identity
+        lock_status = "LOCKED" if item.get("identity_locked") else "UNLOCKED"
+        print(f"#{rank}  [{identity}]  {mets}  ({lock_status})")
         print("-" * 70)
+
         # Word-wrap at 78 chars
         for para in text.split("\n"):
             print(textwrap.fill(para, width=78, initial_indent="  ",
@@ -607,10 +702,14 @@ def main() -> None:
         print("Run nfldiscovery.py to generate fresh findings, or clear the memory log.")
         return
 
+    # ── Build entity registry ─────────────────────────────────────────────────────
+    entity_registry = build_entity_registry(filtered_df)
+    print(f"  Entity registry built: {len(entity_registry)} canonical entities")
+
     # ── Build prompt ─────────────────────────────────────────────────────────────
     session_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}"
     system_prompt, user_prompt = build_prompt(
-        filtered_df, memory_summary, n_insights=args.n_insights
+        filtered_df, memory_summary, registry=entity_registry, n_insights=args.n_insights
     )
 
     if args.dry_run:
@@ -622,6 +721,14 @@ def main() -> None:
         print("USER PROMPT")
         print("=" * 80)
         print(user_prompt)
+        print("\n" + "=" * 80)
+        print("ENTITY REGISTRY")
+        print("=" * 80)
+        for key, val in list(entity_registry.items())[:10]:
+            print(f"  {key}")
+            print(f"    → name={val.get('roster_full_name')}, team={val.get('roster_team')}, pos={val.get('roster_position')}")
+        if len(entity_registry) > 10:
+            print(f"  ... and {len(entity_registry) - 10} more")
         return
 
     # ── Call API ─────────────────────────────────────────────────────────────────
@@ -644,23 +751,41 @@ def main() -> None:
         Path("interpret_raw_response.txt").write_text(raw_response)
         sys.exit(1)
 
-    # ── Apply Team Lock ───────────────────────────────────────────────────────────
-    # Build authoritative player→team mapping from findings table
-    team_mapping = build_team_mapping(filtered_df)
-    if args.verbose:
-        print(f"\nTeam mapping built: {len(team_mapping)} entries")
-
-    # Enforce correct teams on all insights
-    insights, n_overwritten = apply_team_lock(
-        insights, team_mapping, verbose=args.verbose
+    # ── Apply Identity Lock ───────────────────────────────────────────────────────
+    # Merge insights with canonical entity registry - overwrites ALL identity fields
+    valid_insights, quarantined, lock_stats = apply_identity_lock(
+        insights, entity_registry, verbose=args.verbose
     )
-    if n_overwritten > 0:
-        print(f"  TEAM LOCK: {n_overwritten} insight(s) had team field corrected")
 
-    display_insights(insights)
+    print(f"\n  IDENTITY LOCK: {lock_stats['locked']} locked, "
+          f"{lock_stats['quarantined']} quarantined, "
+          f"{lock_stats['overwritten']} had identity corrected")
 
-    # ── Log to memory ─────────────────────────────────────────────────────────────
-    n_logged = log_insights_from_response(insights, session_id=session_id)
+    # ── Validate before report ────────────────────────────────────────────────────
+    validated_insights, validation_errors = validate_insights(
+        valid_insights, entity_registry, verbose=args.verbose
+    )
+
+    if validation_errors:
+        print(f"\n  VALIDATION: {len(validation_errors)} error(s)")
+        if args.verbose:
+            for err in validation_errors:
+                print(f"    - {err}")
+
+    # ── Display & Log ─────────────────────────────────────────────────────────────
+    display_insights(validated_insights, quarantined=quarantined)
+
+    # Log quarantined insights separately if verbose
+    if quarantined and args.verbose:
+        print(f"\n{'='*80}")
+        print(f"QUARANTINED INSIGHTS ({len(quarantined)} total)")
+        print(f"{'='*80}")
+        for q in quarantined:
+            print(f"  entity_key: {q.get('entity_key')}")
+            print(f"  reason: {q.get('quarantine_reason')}")
+            print()
+
+    n_logged = log_insights_from_response(validated_insights, session_id=session_id)
     print(f"\n{n_logged} insights logged to insights_memory/insights_log.jsonl")
     print(f"Session ID: {session_id}")
 
