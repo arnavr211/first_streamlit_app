@@ -603,11 +603,31 @@ def _write_delta_report(
     ]
 
     def _insight_block(item: dict) -> list[str]:
-        rank    = item.get("rank", "?")
-        teams   = ", ".join(item.get("teams") or [])
+        rank = item.get("rank", "?")
+
+        # ── Use LOCKED canonical identity fields, NOT Claude-authored "teams" ──
+        player   = item.get("roster_full_name") or ""
+        team     = item.get("roster_team") or ""
+        position = item.get("roster_position") or ""
+
+        # Build identity string from locked values
+        if player:
+            identity = player
+            if team:
+                identity += f" ({team}"
+                if position:
+                    identity += f", {position}"
+                identity += ")"
+        elif team:
+            identity = team
+        else:
+            identity = item.get("entity_key", "UNKNOWN")
+
         metrics = ", ".join(f"`{m}`" for m in (item.get("metrics") or []))
         dims    = ", ".join(f"`{d}`" for d in (item.get("dimensions") or []))
-        text    = item.get("insight_text", "")
+
+        # Use interpretation (new schema) with insight_text fallback
+        text    = item.get("interpretation") or item.get("insight_text", "")
         ref     = item.get("referenced_insight", "")
         novelty = item.get("novelty_reason", "")
         w_val   = item.get("week_value")
@@ -623,8 +643,11 @@ def _write_delta_report(
             stats_parts.append(f"**Δ:** {float(delta):+.3f}")
         stats_line = " | ".join(stats_parts)
 
+        # Lock status indicator
+        lock_marker = "" if item.get("identity_locked") else " ⚠️"
+
         block = [
-            f"### {rank} · [{teams}] · {metrics}",
+            f"### {rank} · [{identity}]{lock_marker} · {metrics}",
             "",
         ]
         if stats_line:
