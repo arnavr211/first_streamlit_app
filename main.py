@@ -58,12 +58,15 @@ from insights_memory.memory_manager import (
 )
 from interpret import (
     DEFAULT_FINDINGS_CSV,
+    apply_identity_lock,
+    build_entity_registry,
     build_prompt,
     call_claude,
     display_insights,
     filter_findings,
     log_insights_from_response,
     parse_insights,
+    validate_insights,
 )
 from nfldiscovery import (
     _METRIC_BLACKLIST,
@@ -707,8 +710,28 @@ def write_daily_report(
     data_status: dict,
     session_id: str,
     dry_run: bool = False,
+    verbose: bool = False,
 ) -> Path:
-    """Write the standard daily insights report to reports/YYYY-MM-DD-{lens}.md."""
+    """Write the standard daily insights report to reports/YYYY-MM-DD-{lens}.md.
+
+    IMPORTANT: All player/team/position identity fields are read from
+    locked canonical fields (roster_full_name, roster_team, roster_position),
+    NOT from Claude-authored values.
+    """
+    # ── Debug: print final identity fields before writing ──
+    if verbose and insights:
+        print("\n  [DEBUG] Final insights before report writing:")
+        for i, item in enumerate(insights):
+            print(f"    #{i+1}:")
+            print(f"      entity_key: {item.get('entity_key')}")
+            print(f"      player (roster_full_name): {item.get('roster_full_name')}")
+            print(f"      team (roster_team): {item.get('roster_team')}")
+            print(f"      position (roster_position): {item.get('roster_position')}")
+            print(f"      metrics: {item.get('metrics')}")
+            print(f"      identity_locked: {item.get('identity_locked')}")
+            interp = item.get('interpretation') or item.get('insight_text', '')
+            print(f"      interpretation[:100]: {interp[:100]}...")
+        print()
     lens_id   = lens.id if hasattr(lens, "id") else str(lens)
     lens_name = lens.name if hasattr(lens, "name") else lens_id
     lens_desc = lens.description if hasattr(lens, "description") else ""
@@ -779,20 +802,47 @@ def write_daily_report(
     lines += ["", "---", ""]
 
     # ── Insights ──────────────────────────────────────────────────────────────────
+    # IMPORTANT: All identity fields (player, team, position) MUST come from
+    # locked canonical fields, NOT Claude-authored values.
     if insights:
         lines += [
             f"## AI-Interpreted Insights ({len(insights)} new)",
             "",
         ]
         for item in sorted(insights, key=lambda x: x.get("rank", 99)):
-            rank    = item.get("rank", "?")
-            teams   = ", ".join(item.get("teams") or [])
+            rank = item.get("rank", "?")
+
+            # ── Build identity header from LOCKED canonical fields ──
+            # Priority: roster_full_name > roster_team > entity_key
+            player   = item.get("roster_full_name") or ""
+            team     = item.get("roster_team") or ""
+            position = item.get("roster_position") or ""
+
+            # Build identity string from locked values (NOT "teams" array)
+            if player:
+                identity = player
+                if team:
+                    identity += f" ({team}"
+                    if position:
+                        identity += f", {position}"
+                    identity += ")"
+            elif team:
+                identity = team
+            else:
+                # Fallback to entity_key if no locked fields
+                identity = item.get("entity_key", "UNKNOWN")
+
             metrics = ", ".join(f"`{m}`" for m in (item.get("metrics") or []))
-            text    = item.get("insight_text", "")
+
+            # Use interpretation (new schema) or fall back to insight_text (legacy)
+            text = item.get("interpretation") or item.get("insight_text", "")
             novelty = item.get("novelty_reason", "")
 
+            # Lock status indicator
+            lock_marker = "" if item.get("identity_locked") else " ⚠️"
+
             lines += [
-                f"### {rank} · [{teams}] · {metrics}",
+                f"### {rank} · [{identity}]{lock_marker} · {metrics}",
                 "",
                 text,
                 "",
@@ -867,6 +917,8 @@ def main() -> None:
                         help="Comma-separated seasons (default: 2025)")
     parser.add_argument("--show-report", action="store_true",
                         help="Print the most recent report and exit")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show detailed debug output (identity lock operations, etc.)")
     args = parser.parse_args()
 
     if args.show_report:
@@ -1017,18 +1069,44 @@ def main() -> None:
     }
 
     insights = None
+    quarantined_insights = None
+    entity_registry = None
+
     if not filtered_df.empty and not args.dry_run and not args.skip_api:
+        # Build entity registry BEFORE prompt (for identity lock later)
+        entity_registry = build_entity_registry(filtered_df)
+        print(f"  Entity registry built: {len(entity_registry)} canonical entities")
+
         system_prompt, user_prompt = build_prompt(
-            filtered_df, memory_summary, n_insights=args.n_insights
+            filtered_df, memory_summary, registry=entity_registry, n_insights=args.n_insights
         )
         # Inject unvalidated-player warning if roster load failed for player findings
         if _is_player_findings(filtered_df) and not roster_validated:
             print("  ⚠️  Injecting unvalidated-player warning into prompt")
             user_prompt = _UNVALIDATED_PLAYER_WARNING + user_prompt
         try:
-            raw      = call_claude(system_prompt, user_prompt)
-            insights = parse_insights(raw)
-            print(f"  Received {len(insights)} insights from Claude")
+            raw          = call_claude(system_prompt, user_prompt)
+            raw_insights = parse_insights(raw)
+            print(f"  Received {len(raw_insights)} raw insights from Claude")
+
+            # ── Apply Identity Lock ──────────────────────────────────────────────
+            # Merge insights with canonical entity registry - overwrites ALL identity fields
+            valid_insights, quarantined_insights, lock_stats = apply_identity_lock(
+                raw_insights, entity_registry, verbose=args.verbose
+            )
+            print(f"  IDENTITY LOCK: {lock_stats['locked']} locked, "
+                  f"{lock_stats['quarantined']} quarantined, "
+                  f"{lock_stats['overwritten']} corrected")
+
+            # Final validation
+            insights, validation_errors = validate_insights(
+                valid_insights, entity_registry, verbose=args.verbose
+            )
+            if validation_errors:
+                print(f"  VALIDATION: {len(validation_errors)} error(s) auto-corrected")
+
+            print(f"  Final: {len(insights)} validated insights")
+
         except EnvironmentError as e:
             print(f"  WARNING: {e}")
             print("  Continuing without insights (set ANTHROPIC_API_KEY to enable)")
@@ -1059,6 +1137,7 @@ def main() -> None:
         data_status    = data_status,
         session_id     = session_id,
         dry_run        = args.dry_run,
+        verbose        = args.verbose,
     )
 
     # ── Weekly delta report (when new data arrived) ───────────────────────────────
